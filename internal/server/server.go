@@ -18,14 +18,15 @@ import (
 )
 
 type Server struct {
-	db       *sql.DB
-	mux      *http.ServeMux
-	port     int
-	upstream *url.URL
-	proxy    *httputil.ReverseProxy
-	adminKey string
-	limiter  *RateLimiter
-	srv      *http.Server
+	db          *sql.DB
+	mux         *http.ServeMux
+	port        int
+	upstream    *url.URL
+	proxy       *httputil.ReverseProxy
+	adminKey    string
+	limiter     *RateLimiter
+	srv         *http.Server
+	corsOrigins []string // empty = CORS disabled
 }
 
 type Config struct {
@@ -33,6 +34,7 @@ type Config struct {
 	UpstreamURL string
 	AdminKey    string
 	RPM         int // requests per minute (0 = disabled)
+	CORSOrigins string // comma-separated origins, "*" for all
 }
 
 // RateLimiter tracks per-key request counts.
@@ -85,11 +87,21 @@ func New(db *sql.DB, cfg Config) (*Server, error) {
 	}
 
 	mux := http.NewServeMux()
+	var origins []string
+	if cfg.CORSOrigins != "" {
+		for _, o := range strings.Split(cfg.CORSOrigins, ",") {
+			o = strings.TrimSpace(o)
+			if o != "" {
+				origins = append(origins, o)
+			}
+		}
+	}
 	s := &Server{
 		db: db, mux: mux, port: cfg.Port,
 		upstream: upstream, proxy: proxy,
-		adminKey: cfg.AdminKey,
-		limiter:  NewRateLimiter(cfg.RPM),
+		adminKey:    cfg.AdminKey,
+		limiter:     NewRateLimiter(cfg.RPM),
+		corsOrigins: origins,
 	}
 	s.registerRoutes()
 	return s, nil
@@ -106,13 +118,17 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /gate/api/logs", s.adminOnly(s.handleListLogs))
 	s.mux.HandleFunc("GET /gate/api/stats", s.adminOnly(s.handleStats))
 
+	// Session auth (no admin key required)
+	s.mux.HandleFunc("POST /gate/login", s.handleLogin)
+	s.mux.HandleFunc("POST /gate/logout", s.handleLogout)
+
 	// Health (no auth)
 	s.mux.HandleFunc("GET /gate/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	})
 
-	// Everything else goes through auth + proxy
-	s.mux.HandleFunc("/", s.handleProxy)
+	// Everything else goes through CORS + auth + proxy
+	s.mux.HandleFunc("/", s.withCORS(s.handleProxy))
 }
 
 func (s *Server) Start() error {
@@ -418,6 +434,102 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"active_keys":     keys,
 		"upstream":        s.upstream.String(),
 	})
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// CORS Middleware
+// ──────────────────────────────────────────────────────────────────────
+
+func (s *Server) withCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if len(s.corsOrigins) == 0 {
+			next(w, r)
+			return
+		}
+		origin := r.Header.Get("Origin")
+		allowed := false
+		for _, o := range s.corsOrigins {
+			if o == "*" || o == origin {
+				allowed = true
+				break
+			}
+		}
+		if allowed && origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With")
+			w.Header().Set("Vary", "Origin")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(204)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Session Login / Logout
+// ──────────────────────────────────────────────────────────────────────
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" || req.Password == "" {
+		writeJSON(w, 400, map[string]string{"error": "username and password required"})
+		return
+	}
+
+	var userID int
+	var storedHash, role string
+	var enabled int
+	err := s.db.QueryRow("SELECT id, password_hash, role, enabled FROM users WHERE username = ?", req.Username).
+		Scan(&userID, &storedHash, &role, &enabled)
+	if err != nil || enabled != 1 {
+		writeJSON(w, 401, map[string]string{"error": "invalid credentials"})
+		return
+	}
+	if !store.CheckPassword(req.Password, storedHash) {
+		writeJSON(w, 401, map[string]string{"error": "invalid credentials"})
+		return
+	}
+
+	// Create session
+	sessionID := store.GenerateSessionID()
+	expires := time.Now().Add(24 * time.Hour)
+	_, err = s.db.Exec("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)",
+		sessionID, userID, expires.Format("2006-01-02 15:04:05"))
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "failed to create session"})
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "gate_session",
+		Value:    sessionID,
+		Expires:  expires,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Path:     "/",
+	})
+	writeJSON(w, 200, map[string]any{"user_id": userID, "username": req.Username, "role": role})
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie("gate_session")
+	if err == nil {
+		s.db.Exec("DELETE FROM sessions WHERE id = ?", cookie.Value)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:    "gate_session",
+		Value:   "",
+		Expires: time.Unix(0, 0),
+		Path:    "/",
+	})
+	writeJSON(w, 200, map[string]string{"status": "logged out"})
 }
 
 // Helpers

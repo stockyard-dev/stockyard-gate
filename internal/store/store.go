@@ -109,6 +109,10 @@ func HashPassword(password string) string {
 	return hex.EncodeToString(h[:])
 }
 
+func CheckPassword(password, hash string) bool {
+	return HashPassword(password) == hash
+}
+
 func GenerateSessionID() string {
 	b := make([]byte, 32)
 	rand.Read(b)

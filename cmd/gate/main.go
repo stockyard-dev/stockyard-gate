@@ -58,6 +58,8 @@ func main() {
 		dataDir = d
 	}
 
+	corsOrigins := os.Getenv("GATE_CORS_ORIGINS") // e.g. "https://app.example.com,https://admin.example.com" or "*"
+
 	db, err := store.Open(dataDir)
 	if err != nil {
 		log.Fatalf("database: %v", err)
@@ -69,6 +71,7 @@ func main() {
 		UpstreamURL: upstream,
 		AdminKey:    adminKey,
 		RPM:         rpm,
+		CORSOrigins: corsOrigins,
 	})
 	if err != nil {
 		log.Fatalf("server: %v", err)
@@ -89,6 +92,9 @@ func main() {
 	log.Printf("  Admin API: http://localhost:%d/gate/api (requires GATE_ADMIN_KEY)", port)
 	log.Printf("  Health:    http://localhost:%d/gate/health", port)
 	log.Printf("  Rate limit: %d req/min", rpm)
+	if corsOrigins != "" {
+		log.Printf("  CORS origins: %s", corsOrigins)
+	}
 	log.Printf("")
 
 	<-ctx.Done()
