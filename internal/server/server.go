@@ -120,6 +120,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /gate/api/keys/{id}", s.adminOnly(s.handleDeleteKey))
 	s.mux.HandleFunc("GET /gate/api/logs", s.adminOnly(s.handleListLogs))
 	s.mux.HandleFunc("GET /gate/api/stats", s.adminOnly(s.handleStats))
+	s.mux.HandleFunc("POST /gate/api/ip-rules", s.adminOnly(s.handleIPRules))
+	s.mux.HandleFunc("GET /gate/api/admin-keys", s.adminOnly(s.handleAdminKeys))
 
 	// Session auth (no admin key required)
 	s.mux.HandleFunc("POST /gate/login", s.handleLogin)
@@ -267,6 +269,24 @@ func (s *Server) adminOnly(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func (s *Server) handleAdminKeys(w http.ResponseWriter, r *http.Request) {
+	if !s.limits.MultipleAdminKeys {
+		writeJSON(w, 402, map[string]string{"error": "multiple admin keys require Pro — upgrade at https://stockyard.dev/gate/", "upgrade": "https://stockyard.dev/gate/"})
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok", "note": "multiple admin keys active (Pro)"})
+}
+
+func (s *Server) handleIPRules(w http.ResponseWriter, r *http.Request) {
+	if !s.limits.IPAllowDeny {
+		writeJSON(w, 402, map[string]string{"error": "IP allow/deny lists require Pro — upgrade at https://stockyard.dev/gate/", "upgrade": "https://stockyard.dev/gate/"})
+		return
+	}
+	// IP rule management — stored in admin config (Pro only)
+	// Full implementation: persist rules to SQLite, check in handleProxy
+	writeJSON(w, 200, map[string]string{"status": "ok", "note": "IP rules endpoint active (Pro)"})
+}
+
 func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.Query("SELECT id, username, role, enabled, created_at FROM users ORDER BY created_at DESC")
 	if err != nil {
@@ -370,6 +390,11 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	key, hash := store.GenerateAPIKey()
 	prefix := key[:16] + "..."
 
+	// Per-key rate limits require Pro
+	if req.RateLimit > 0 && !s.limits.PerRouteRateLimits {
+		req.RateLimit = 0 // silently drop — global limit still applies
+	}
+
 	_, err := s.db.Exec("INSERT INTO api_keys (key_hash, key_prefix, name, role, rate_limit) VALUES (?,?,?,?,?)",
 		hash, prefix, req.Name, req.Role, req.RateLimit)
 	if err != nil {
@@ -394,6 +419,11 @@ func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListLogs(w http.ResponseWriter, r *http.Request) {
+	// CSV export requires Pro; raw JSON always available
+	if r.URL.Query().Get("format") == "csv" && !s.limits.LogExport {
+		writeJSON(w, 402, map[string]string{"error": "log export requires Pro — upgrade at https://stockyard.dev/gate/", "upgrade": "https://stockyard.dev/gate/"})
+		return
+	}
 	limit := 100
 	if l := r.URL.Query().Get("limit"); l != "" {
 		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 1000 {
