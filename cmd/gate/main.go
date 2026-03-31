@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/stockyard-dev/stockyard-gate/internal/server"
+	"github.com/stockyard-dev/stockyard-gate/internal/license"
 	"github.com/stockyard-dev/stockyard-gate/internal/store"
 )
 
@@ -60,6 +61,20 @@ func main() {
 
 	corsOrigins := os.Getenv("GATE_CORS_ORIGINS") // e.g. "https://app.example.com,https://admin.example.com" or "*"
 
+	// License validation — offline Ed25519 check, no network call
+	licenseKey := os.Getenv("GATE_LICENSE_KEY")
+	licInfo, licErr := license.Validate(licenseKey, "gate")
+	if licenseKey != "" && licErr != nil {
+		log.Printf("[license] WARNING: %v — running in free tier", licErr)
+		licInfo = nil
+	}
+	limits := server.LimitsFor(licInfo)
+	if licInfo != nil && licInfo.IsPro() {
+		log.Printf("  License:   Pro (%s)", licInfo.CustomerID)
+	} else {
+		log.Printf("  License:   Free tier (set GATE_LICENSE_KEY to unlock Pro)")
+	}
+
 	db, err := store.Open(dataDir)
 	if err != nil {
 		log.Fatalf("database: %v", err)
@@ -67,6 +82,7 @@ func main() {
 	defer db.Close()
 
 	srv, err := server.New(db.Conn(), server.Config{
+		Limits: limits,
 		Port:        port,
 		UpstreamURL: upstream,
 		AdminKey:    adminKey,

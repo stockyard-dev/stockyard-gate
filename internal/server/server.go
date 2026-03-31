@@ -27,6 +27,7 @@ type Server struct {
 	limiter     *RateLimiter
 	srv         *http.Server
 	corsOrigins []string // empty = CORS disabled
+	limits      Limits
 }
 
 type Config struct {
@@ -35,6 +36,7 @@ type Config struct {
 	AdminKey    string
 	RPM         int // requests per minute (0 = disabled)
 	CORSOrigins string // comma-separated origins, "*" for all
+	Limits      Limits
 }
 
 // RateLimiter tracks per-key request counts.
@@ -102,6 +104,7 @@ func New(db *sql.DB, cfg Config) (*Server, error) {
 		adminKey:    cfg.AdminKey,
 		limiter:     NewRateLimiter(cfg.RPM),
 		corsOrigins: origins,
+		limits:      cfg.Limits,
 	}
 	s.registerRoutes()
 	return s, nil
@@ -303,6 +306,14 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		req.Role = "user"
 	}
 	hash := store.HashPassword(req.Password)
+	if s.limits.MaxUsers > 0 {
+		var cnt int
+		s.db.QueryRow("SELECT COUNT(*) FROM users").Scan(&cnt)
+		if LimitReached(s.limits.MaxUsers, cnt) {
+			writeJSON(w, 402, map[string]string{"error": "free tier limit: " + strconv.Itoa(s.limits.MaxUsers) + " users max — upgrade to Pro", "upgrade": "https://stockyard.dev/gate/"})
+			return
+		}
+	}
 	res, err := s.db.Exec("INSERT INTO users (username, password_hash, role) VALUES (?,?,?)", req.Username, hash, req.Role)
 	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": "username already exists"})
