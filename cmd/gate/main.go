@@ -107,6 +107,7 @@ func main() {
 	log.Printf("  Proxy:     http://localhost:%d → %s", port, upstream)
 	log.Printf("  Admin API: http://localhost:%d/gate/api (requires GATE_ADMIN_KEY)", port)
 	log.Printf("  Health:    http://localhost:%d/gate/health", port)
+	log.Printf("  Dashboard: http://localhost:%d/ui", port)
 	log.Printf("  Rate limit: %d req/min", rpm)
 	if corsOrigins != "" {
 		log.Printf("  CORS origins: %s", corsOrigins)

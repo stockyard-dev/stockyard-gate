@@ -128,6 +128,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /gate/logout", s.handleLogout)
 
 	// Health (no auth)
+	s.mux.HandleFunc("GET /ui", s.handleUI)
 	s.mux.HandleFunc("GET /gate/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	})
