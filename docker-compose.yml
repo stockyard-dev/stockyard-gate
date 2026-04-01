@@ -1,0 +1,35 @@
+# docker-compose.yml for gate
+# Quick start:
+#   FENCE_ENCRYPTION_KEY=$(openssl rand -hex 32) docker compose up -d
+#
+# For production, set env vars in a .env file or your orchestrator secrets.
+# Never commit real keys to version control.
+
+services:
+  gate:
+    image: ghcr.io/stockyard-dev/stockyard-gate:latest
+    # Or build locally:
+    # build: .
+    ports:
+      - "8780:8780"
+    environment:
+      - PORT=${{STOCKYARD_PORT:-8780}}
+      - DATA_DIR=${{STOCKYARD_DATA_DIR:-/data}}
+      - GATE_UPSTREAM=${{STOCKYARD_GATE_UPSTREAM:-http://localhost:3000}}
+      - GATE_ADMIN_KEY=${{STOCKYARD_GATE_ADMIN_KEY:-changeme}}
+      - GATE_RPM=${{STOCKYARD_GATE_RPM:-60}}
+      - GATE_CORS_ORIGINS=${{STOCKYARD_GATE_CORS_ORIGINS:-}}
+      - GATE_LICENSE_KEY=${{STOCKYARD_GATE_LICENSE_KEY:-}}
+    volumes:
+      - gate-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8780/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  gate-data:
+    driver: local

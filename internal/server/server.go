@@ -124,6 +124,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /gate/api/admin-keys", s.adminOnly(s.handleAdminKeys))
 
 	// Session auth (no admin key required)
+	s.mux.HandleFunc("GET /gate/login", s.handleLoginPage)
 	s.mux.HandleFunc("POST /gate/login", s.handleLogin)
 	s.mux.HandleFunc("POST /gate/logout", s.handleLogout)
 
@@ -163,6 +164,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		sourceIP = strings.Split(fwd, ",")[0]
 	}
 
+	// IP allow/deny check (Pro feature — enforced when rules exist)
+	if s.limits.IPAllowDeny {
+		s.db.Exec(`CREATE TABLE IF NOT EXISTS ip_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, action TEXT NOT NULL, note TEXT DEFAULT '', created_at DATETIME DEFAULT (datetime('now')))`)
+		var action string
+		cleanIP := strings.Split(sourceIP, ":")[0]
+		err := s.db.QueryRow("SELECT action FROM ip_rules WHERE ip = ? ORDER BY id DESC LIMIT 1", cleanIP).Scan(&action)
+		if err == nil && action == "deny" {
+			s.logAccess(r.Method, r.URL.Path, 403, sourceIP, 0, "", int(time.Since(start).Milliseconds()))
+			writeJSON(w, 403, map[string]string{"error": "IP address blocked"})
+			return
+		}
+	}
+
 	// Check API key auth
 	var keyPrefix string
 	var userID int
@@ -200,6 +214,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// No auth found
 	if apiKey == "" && userID == 0 {
 		s.logAccess(r.Method, r.URL.Path, 401, sourceIP, 0, "", int(time.Since(start).Milliseconds()))
+		// Redirect browsers to login page; return JSON for API clients
+		accept := r.Header.Get("Accept")
+		if strings.Contains(accept, "text/html") {
+			http.Redirect(w, r, "/gate/login", http.StatusFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(401)
 		w.Write([]byte(`{"error":"authentication required","methods":["API key (Authorization: Bearer sk-gate-...)","Session cookie"]}`))
@@ -283,9 +303,51 @@ func (s *Server) handleIPRules(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 402, map[string]string{"error": "IP allow/deny lists require Pro — upgrade at https://stockyard.dev/gate/", "upgrade": "https://stockyard.dev/gate/"})
 		return
 	}
-	// IP rule management — stored in admin config (Pro only)
-	// Full implementation: persist rules to SQLite, check in handleProxy
-	writeJSON(w, 200, map[string]string{"status": "ok", "note": "IP rules endpoint active (Pro)"})
+	if r.Method == "GET" {
+		rows, err := s.db.Query("SELECT id, ip, action, note, created_at FROM ip_rules ORDER BY created_at DESC")
+		if err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+		type IPRule struct {
+			ID        int    `json:"id"`
+			IP        string `json:"ip"`
+			Action    string `json:"action"`
+			Note      string `json:"note"`
+			CreatedAt string `json:"created_at"`
+		}
+		var rules []IPRule
+		for rows.Next() {
+			var rule IPRule
+			rows.Scan(&rule.ID, &rule.IP, &rule.Action, &rule.Note, &rule.CreatedAt)
+			rules = append(rules, rule)
+		}
+		writeJSON(w, 200, map[string]any{"rules": rules})
+		return
+	}
+	var req struct {
+		IP     string `json:"ip"`
+		Action string `json:"action"` // "allow" or "deny"
+		Note   string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IP == "" {
+		writeJSON(w, 400, map[string]string{"error": "ip and action required"})
+		return
+	}
+	if req.Action != "allow" && req.Action != "deny" {
+		writeJSON(w, 400, map[string]string{"error": "action must be allow or deny"})
+		return
+	}
+	// Ensure table exists
+	s.db.Exec(`CREATE TABLE IF NOT EXISTS ip_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, action TEXT NOT NULL, note TEXT DEFAULT '', created_at DATETIME DEFAULT (datetime('now')))`)
+		res, err := s.db.Exec("INSERT INTO ip_rules (ip, action, note) VALUES (?,?,?)", req.IP, req.Action, req.Note)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	id, _ := res.LastInsertId()
+	writeJSON(w, 200, map[string]any{"id": id, "ip": req.IP, "action": req.Action})
 }
 
 func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
@@ -557,6 +619,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		Path:     "/",
 	})
+	// Redirect browsers to dashboard; return JSON for API clients
+	accept := r.Header.Get("Accept")
+	if strings.Contains(accept, "text/html") || r.Header.Get("Content-Type") == "application/x-www-form-urlencoded" {
+		http.Redirect(w, r, "/ui", http.StatusFound)
+		return
+	}
 	writeJSON(w, 200, map[string]any{"user_id": userID, "username": req.Username, "role": role})
 }
 
@@ -583,3 +651,116 @@ func writeJSON(w http.ResponseWriter, code int, data any) {
 }
 
 // Ensure unused imports don't fail
+
+// handleLoginPage serves the HTML login form for browser-based access.
+func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(loginPageHTML))
+}
+
+const loginPageHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Gate — Sign In</title>
+<link href="https://fonts.googleapis.com/css2?family=Libre+Baskerville:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#1a1410;--bg2:#241e18;--bg3:#2e261e;--rust:#c45d2c;--rust-light:#e8753a;--leather:#a0845c;--cream:#f0e6d3;--cream-dim:#bfb5a3;--gold:#d4a843;--green:#5ba86e;--red:#c0392b;--font-serif:'Libre Baskerville',Georgia,serif;--font-mono:'JetBrains Mono',monospace}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--cream);font-family:var(--font-serif);min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:2rem}
+.card{background:var(--bg2);border:1px solid var(--bg3);border-top:2px solid var(--rust);max-width:400px;width:100%;padding:2.5rem}
+.brand{display:flex;align-items:center;gap:.6rem;margin-bottom:2rem}
+.brand-logo svg{display:block}
+.brand-text{font-family:var(--font-mono);font-size:.8rem;color:var(--leather);letter-spacing:3px;text-transform:uppercase}
+.brand-product{font-family:var(--font-mono);font-size:.8rem;color:var(--cream);margin-left:.3rem}
+h1{font-size:1.2rem;margin-bottom:.4rem}
+.sub{font-family:var(--font-mono);font-size:.72rem;color:var(--leather);margin-bottom:2rem}
+.field{margin-bottom:1.2rem}
+label{display:block;font-family:var(--font-mono);font-size:.65rem;letter-spacing:2px;text-transform:uppercase;color:var(--leather);margin-bottom:.4rem}
+input{width:100%;background:var(--bg3);border:1px solid var(--bg3);color:var(--cream);font-family:var(--font-mono);font-size:.85rem;padding:.65rem .8rem;outline:none;transition:border-color .15s}
+input:focus{border-color:var(--leather)}
+.btn{width:100%;background:var(--rust);color:var(--cream);border:none;font-family:var(--font-mono);font-size:.85rem;padding:.75rem;cursor:pointer;transition:background .15s;margin-top:.5rem}
+.btn:hover{background:var(--rust-light)}
+.error{background:#2a1a1a;border-left:3px solid var(--red);padding:.7rem 1rem;font-family:var(--font-mono);font-size:.78rem;color:#e57373;margin-bottom:1rem;display:none}
+.divider{border-top:1px solid var(--bg3);margin:1.5rem 0;position:relative}
+.divider-text{position:absolute;top:-9px;left:50%;transform:translateX(-50%);background:var(--bg2);padding:0 .8rem;font-family:var(--font-mono);font-size:.65rem;color:var(--leather)}
+.api-note{font-family:var(--font-mono);font-size:.7rem;color:var(--leather);line-height:1.6}
+code{background:var(--bg3);padding:.1rem .4rem;color:var(--cream-dim)}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand">
+    <div class="brand-logo">
+      <svg viewBox="0 0 64 64" width="28" height="28" fill="none">
+        <rect x="8" y="8" width="8" height="48" rx="2.5" fill="#e8753a"/>
+        <rect x="28" y="8" width="8" height="48" rx="2.5" fill="#e8753a"/>
+        <rect x="48" y="8" width="8" height="48" rx="2.5" fill="#e8753a"/>
+        <rect x="8" y="27" width="48" height="7" rx="2.5" fill="#c4a87a"/>
+      </svg>
+    </div>
+    <span class="brand-text">Stockyard <span class="brand-product">/ Gate</span></span>
+  </div>
+
+  <h1>Sign in</h1>
+  <p class="sub">Protected by Gate &mdash; auth proxy for internal tools</p>
+
+  <div class="error" id="err"></div>
+
+  <div class="field">
+    <label>Username</label>
+    <input type="text" id="username" autocomplete="username" autofocus placeholder="alice">
+  </div>
+  <div class="field">
+    <label>Password</label>
+    <input type="password" id="password" autocomplete="current-password" placeholder="••••••••">
+  </div>
+  <button class="btn" onclick="login()">Sign in &rarr;</button>
+
+  <div class="divider"><span class="divider-text">or use an API key</span></div>
+  <p class="api-note">
+    For programmatic access, pass a bearer token:<br>
+    <code>Authorization: Bearer sk-gate-...</code>
+  </p>
+</div>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') login();
+});
+
+async function login() {
+  var username = document.getElementById('username').value.trim();
+  var password = document.getElementById('password').value;
+  var errEl = document.getElementById('err');
+  errEl.style.display = 'none';
+
+  if (!username || !password) {
+    errEl.textContent = 'Username and password required.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  try {
+    var r = await fetch('/gate/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+      body: JSON.stringify({username: username, password: password})
+    });
+    if (r.ok) {
+      window.location.href = '/ui';
+    } else {
+      var d = await r.json().catch(function(){ return {}; });
+      errEl.textContent = d.error || 'Invalid credentials.';
+      errEl.style.display = 'block';
+      document.getElementById('password').value = '';
+    }
+  } catch(e) {
+    errEl.textContent = 'Network error — please try again.';
+    errEl.style.display = 'block';
+  }
+}
+</script>
+</body>
+</html>`
