@@ -14,21 +14,26 @@ const publicKeyHex = "3af8f9593b3331c27994f1eeacf111c727ff6015016b0af44ed3ca6934
 
 type Limits struct {
 	MaxItems int
+	MaxUsers int
+	IPAllowDeny bool
+	MultipleAdminKeys bool
+	PerRouteRateLimits bool
+	LogExport bool
 	Tier     string
 }
 
 func FreeLimits() Limits {
-	return Limits{MaxItems: 10, Tier: "free"}
+	return Limits{MaxItems: 5, MaxUsers: 5, IPAllowDeny: false, MultipleAdminKeys: false, PerRouteRateLimits: false, LogExport: false, Tier: "free"}
 }
 
 func ProLimits() Limits {
-	return Limits{MaxItems: 0, Tier: "pro"}
+	return Limits{MaxItems: 0, MaxUsers: 0, IPAllowDeny: true, MultipleAdminKeys: true, PerRouteRateLimits: true, LogExport: true, Tier: "pro"}
 }
 
 func DefaultLimits() Limits {
 	key := os.Getenv("STOCKYARD_LICENSE_KEY")
 	if key == "" {
-		log.Printf("[license] Free tier (10 items). Set STOCKYARD_LICENSE_KEY for Pro.")
+		log.Printf("[license] Free tier (5 items). Set STOCKYARD_LICENSE_KEY for Pro.")
 		log.Printf("[license] Get a key at https://stockyard.dev/gate/")
 		return FreeLimits()
 	}

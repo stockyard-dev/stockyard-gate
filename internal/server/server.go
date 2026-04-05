@@ -136,7 +136,7 @@ func (s *Server) registerRoutes() {
 
 	// Everything else goes through CORS + auth + proxy
 	s.mux.HandleFunc("/", s.withCORS(s.handleProxy))
-s.mux.HandleFunc("GET /api/tier",func(w http.ResponseWriter,r *http.Request){wj(w,200,map[string]any{"tier":s.limits.Tier,"upgrade_url":"https://stockyard.dev/gate/"})})
+s.mux.HandleFunc("GET /api/tier",func(w http.ResponseWriter,r *http.Request){writeJSON(w,200,map[string]any{"tier":s.limits.Tier,"upgrade_url":"https://stockyard.dev/gate/"})})
 }
 
 func (s *Server) Start() error {
